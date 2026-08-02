@@ -3707,6 +3707,18 @@ fn resolve_post_scrub_risk(
     }
 }
 
+/// Finding labels retained in redaction telemetry but excluded from residual-risk tiering.
+///
+/// `local_path` appeared in 93.3% of a measured 2,630-session corpus, so its presence alone
+/// carries almost no information about residual PII risk. This is deliberately an allow-list of
+/// non-raising labels: unknown future detector labels raise severity by default. Matching must
+/// remain exact so prefix-bearing secret and privacy-filter labels are never admitted by accident.
+const NON_RISK_RAISING_FINDING_LABELS: &[&str] = &["local_path"];
+
+fn finding_raises_residual_risk(label: &str) -> bool {
+    !NON_RISK_RAISING_FINDING_LABELS.contains(&label)
+}
+
 fn residual_risk(consent: &ConsentMetadata, report: &RedactionReport) -> ResidualPiiRisk {
     if report.blocked_secret_detected || report.key_finding_detected {
         return ResidualPiiRisk::High;
@@ -3717,7 +3729,13 @@ fn residual_risk(consent: &ConsentMetadata, report: &RedactionReport) -> Residua
     // who under-reports risk should not be able to land in accepted
     // storage with a Low classification just because the flags are
     // clean; the pass has direct evidence the flags are wrong.
-    if !report.counts.is_empty() || !report.pii_labels_present.is_empty() {
+    if report
+        .counts
+        .keys()
+        .map(String::as_str)
+        .chain(report.pii_labels_present.iter().map(String::as_str))
+        .any(finding_raises_residual_risk)
+    {
         return ResidualPiiRisk::Medium;
     }
 
@@ -4993,6 +5011,197 @@ pub fn apply_credit_estimate_to_envelope(envelope: &mut TraceContributionEnvelop
 #[cfg(test)]
 mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn consent_with_content(message_text: bool, tool_payloads: bool) -> super::ConsentMetadata {
+        super::ConsentMetadata {
+            policy_version: super::TRACE_CONTRIBUTION_POLICY_VERSION.to_string(),
+            scopes: vec![super::ConsentScope::DebuggingEvaluation],
+            message_text_included: message_text,
+            tool_payloads_included: tool_payloads,
+            revocable: true,
+        }
+    }
+
+    fn report_with_findings(counts: &[&str], labels: &[&str]) -> super::RedactionReport {
+        super::RedactionReport {
+            counts: counts
+                .iter()
+                .map(|label| ((*label).to_string(), 1))
+                .collect(),
+            pii_labels_present: labels.iter().map(|label| (*label).to_string()).collect(),
+            ..super::RedactionReport::default()
+        }
+    }
+
+    #[test]
+    fn non_risk_raising_findings_allowlist_is_exact() {
+        assert_eq!(super::NON_RISK_RAISING_FINDING_LABELS, &["local_path"]);
+    }
+
+    #[test]
+    fn local_path_only_findings_are_low_without_content_consent() {
+        let report = report_with_findings(&["local_path"], &["local_path"]);
+
+        assert_eq!(
+            super::residual_risk(&consent_with_content(false, false), &report),
+            super::ResidualPiiRisk::Low
+        );
+    }
+
+    #[test]
+    fn local_path_findings_defer_medium_to_message_text_consent() {
+        let report = report_with_findings(&["local_path"], &["local_path"]);
+
+        assert_eq!(
+            super::residual_risk(&consent_with_content(true, false), &report),
+            super::ResidualPiiRisk::Medium
+        );
+    }
+
+    #[test]
+    fn local_path_does_not_mask_private_email() {
+        let report = report_with_findings(
+            &["local_path", "private_email"],
+            &["local_path", "private_email"],
+        );
+
+        assert_eq!(
+            super::residual_risk(&consent_with_content(false, false), &report),
+            super::ResidualPiiRisk::Medium
+        );
+    }
+
+    #[test]
+    fn local_path_with_blocked_secret_is_high() {
+        let mut report = report_with_findings(
+            &["local_path", "secret:openai_api_key"],
+            &["local_path", "secret:openai_api_key"],
+        );
+        report.blocked_secret_detected = true;
+
+        assert_eq!(
+            super::residual_risk(&consent_with_content(false, false), &report),
+            super::ResidualPiiRisk::High
+        );
+    }
+
+    #[test]
+    fn unknown_finding_in_either_report_operand_is_medium() {
+        for report in [
+            report_with_findings(&["future_detector"], &[]),
+            report_with_findings(&[], &["future_detector"]),
+        ] {
+            assert_eq!(
+                super::residual_risk(&consent_with_content(false, false), &report),
+                super::ResidualPiiRisk::Medium
+            );
+        }
+    }
+
+    #[test]
+    fn local_path_only_in_either_report_operand_is_low() {
+        for report in [
+            report_with_findings(&["local_path"], &[]),
+            report_with_findings(&[], &["local_path"]),
+        ] {
+            assert_eq!(
+                super::residual_risk(&consent_with_content(false, false), &report),
+                super::ResidualPiiRisk::Low
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_bearing_findings_are_not_exempt() {
+        for label in [
+            "secret:openai_api_key",
+            "privacy_filter:secret",
+            "local_path:future_detector",
+        ] {
+            let report = report_with_findings(&[label], &[label]);
+            assert_eq!(
+                super::residual_risk(&consent_with_content(false, false), &report),
+                super::ResidualPiiRisk::Medium,
+                "{label} must raise residual risk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn low_risk_envelope_preserves_local_path_redaction_telemetry() {
+        use super::{
+            DeterministicTraceRedactor, IronclawTraceMetadata, RawTraceContribution,
+            RawTraceContributionEvent, ReplayMetadata, TraceChannel, TraceContributionEventType,
+            TraceRedactor, ValueMetadata,
+        };
+        use chrono::Utc;
+        use serde_json::Value;
+        use std::collections::BTreeMap;
+        use uuid::Uuid;
+
+        let now = Utc::now();
+        let raw = RawTraceContribution {
+            trace_id: Uuid::new_v4(),
+            submission_id: Uuid::new_v4(),
+            created_at: now,
+            ironclaw: IronclawTraceMetadata {
+                version: "test".to_string(),
+                engine_version: None,
+                feature_flags: BTreeMap::new(),
+                channel: TraceChannel::Cli,
+                model_name: None,
+            },
+            consent: consent_with_content(false, false),
+            contributor: super::ContributorMetadata {
+                pseudonymous_contributor_id: None,
+                tenant_scope_ref: None,
+                credit_account_ref: None,
+                revocation_handle: Uuid::new_v4(),
+            },
+            events: vec![RawTraceContributionEvent {
+                event_id: Uuid::new_v4(),
+                event_type: TraceContributionEventType::UserMessage,
+                timestamp: now,
+                content: Some("read /Users/alice/project/src/main.rs".to_string()),
+                structured_payload: Value::Null,
+                tool_name: None,
+                latency_ms: None,
+                token_counts: None,
+                cost_usd: None,
+            }],
+            outcome: super::OutcomeMetadata::default(),
+            replay: ReplayMetadata {
+                replayable: false,
+                required_tools: Vec::new(),
+                tool_manifest_hashes: BTreeMap::new(),
+                expected_assertions: Vec::new(),
+                replay_notes: Vec::new(),
+            },
+            embedding_analysis: None,
+            value: ValueMetadata::default(),
+        };
+        let redactor = DeterministicTraceRedactor::new(vec!["/Users/alice".to_string()])
+            .expect("redactor should initialize");
+
+        let envelope = redactor
+            .redact_trace(raw)
+            .await
+            .expect("trace should redact");
+
+        assert_eq!(
+            envelope.privacy.residual_pii_risk,
+            super::ResidualPiiRisk::Low
+        );
+        assert_eq!(
+            envelope.privacy.redaction_counts.get("local_path"),
+            Some(&1)
+        );
+        assert_eq!(envelope.privacy.pii_labels_present, vec!["local_path"]);
+        assert_eq!(
+            envelope.events[0].redacted_content.as_deref(),
+            Some("read <PRIVATE_LOCAL_PATH_1>")
+        );
+    }
 
     #[test]
     fn read_privacy_env_prefers_canonical_then_legacy() {
